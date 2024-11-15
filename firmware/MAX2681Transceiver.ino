@@ -13,6 +13,7 @@ VFO signal output on CLK0, BFO signal on CLK2
 #include <RotaryEncoder.h>
 #include <U8g2lib.h>
 #include <Morse.h>
+#include <SimpleTimer.h>
 
 // Pin defines
 #define TX_PIN 0
@@ -41,7 +42,7 @@ VFO signal output on CLK0, BFO signal on CLK2
 #define SWR_BUFFER_SIZE 10
 
 // Defaults
-#define DEFAULT_KEYER_SPEED 16
+#define DEFAULT_KEYER_SPEED 20
 
 // Other constants
 #define BUTTON_1_ADC 192
@@ -62,9 +63,9 @@ VFO signal output on CLK0, BFO signal on CLK2
 #define BUTTON_ENC_ADC 2065
 #define BUTTON_ENC_ADC_LOW BUTTON_ENC_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_ENC_ADC_HIGH BUTTON_ENC_ADC + BUTTON_ADC_MARGIN
+#define DRAW_OLED_STEP_TIME 9
 
 // #define _TASK_MICRO_RES
-#define _TASK_TIMECRITICAL
 #define _TASK_PRIORITY
 #include <TaskScheduler.h>
 
@@ -73,37 +74,39 @@ enum class KeyerState {IDLE, DIT, DAH, DITIDLE, DAHIDLE, CHARSPACE, PLAYBACK, AN
 enum class Button {NONE, S1, S2, S3, S4, S5, S_ENC, HOLD};
 enum class KeyerMode {A, B, STRAIGHT};
 
-// Class instantiation
-Si5351 si5351;
-RotaryEncoder *encoder = nullptr;
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-// U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-Scheduler runner;
-Scheduler hprunner;
-Morse morse(TX_PIN, DEFAULT_KEYER_SPEED);
-
 // Task function prototypes
 void draw_oled();
 void process_inputs();
 void process_keyer();
+void morse_update();
 void key_down();
 void key_up();
 void keyer_ditdah_expire();
 void keyer_charspace_expire();
 
+// Class instantiation
+Si5351 si5351;
+RotaryEncoder *encoder = nullptr;
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+Scheduler runner;
+Scheduler hprunner;
+Morse morse(&key_down, &key_up, DEFAULT_KEYER_SPEED);
+
 // Tasks
-Task task_draw_oled(100, TASK_FOREVER, &draw_oled, &runner, true);
-Task task_process_inputs(TASK_IMMEDIATE, TASK_FOREVER, &process_inputs, &hprunner, true);
 Task task_process_keyer(1, TASK_FOREVER, &process_keyer, &hprunner, true);
-Task task_key_down(TASK_IMMEDIATE, TASK_ONCE, &key_down, &hprunner, false);
-Task task_key_up(TASK_IMMEDIATE, TASK_ONCE, &key_up, &hprunner, false);
-Task task_keyer_ditdah_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_ditdah_expire, &hprunner, false);
-Task task_keyer_charspace_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_charspace_expire, &hprunner, false);
+Task task_keyer_update(1, TASK_FOREVER, &morse_update, &hprunner, true);
+Task task_process_inputs(25, TASK_FOREVER, &process_inputs, &runner, true);
+Task task_draw_oled(DRAW_OLED_STEP_TIME, TASK_FOREVER, &draw_oled, &runner, true);
+Task task_key_down(TASK_IMMEDIATE, TASK_ONCE, &key_down, &runner, false);
+Task task_key_up(TASK_IMMEDIATE, TASK_ONCE, &key_up, &runner, false);
+Task task_keyer_ditdah_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_ditdah_expire, &runner, false);
+Task task_keyer_charspace_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_charspace_expire, &runner, false);
 
 // Interrupt service routine variables
 volatile unsigned long frequency = 14060000UL; // This will be the frequency it always starts on.
 volatile unsigned long cw_tone = 600UL;  // CW listening frequency
 volatile bool tx = false;
+volatile bool led = false;
 volatile bool break_in = true;
 volatile bool paddle_tip_active = false;
 volatile bool paddle_ring_active = false;
@@ -120,6 +123,7 @@ int freqsteps = 1;
 uint32_t supply_voltage = 0;
 uint16_t button_adc = 0;
 uint32_t button_press_time;
+Button cur_button;
 Button last_button = Button::NONE;
 uint32_t tx_pwr_fwd = 0;
 uint32_t tx_pwr_rev = 0;
@@ -134,6 +138,9 @@ bool paddle_reverse = false;
 KeyerMode keyer_mode = KeyerMode::A;
 uint16_t dit_length;
 uint32_t keyer_speed = DEFAULT_KEYER_SPEED;
+float gamma;
+float swr;
+char freq_str[15];
 
 // This interrupt routine will be called on any change of one of the input signals
 void checkPosition() {
@@ -191,15 +198,13 @@ void sprintf_seperated(char *str, unsigned long num) {
 }
 
 void draw_oled(void) {
-  char temp_str[21];
+  // char temp_str[41];
   u8g2.clearBuffer();
 
   // Draw frequency
   u8g2.setFont(u8g2_font_logisoso20_tn);
-  sprintf_seperated(temp_str, frequency);
-  yield();
-  u8g2.drawStr(0, 32, temp_str);
-  yield();
+  // sprintf_seperated(temp_str, frequency);
+  u8g2.drawStr(0, 31, freq_str);
 
   // Draw frequency step
   // 10s digit x-value: 118
@@ -223,17 +228,23 @@ void draw_oled(void) {
       u8g2.drawBox(68, 33, 5, 2);
       break;
   }
-  // u8g2.drawBox(68, 33, 5, 2);
-  yield();
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_2);
+}
 
+void draw_oled_2(void) {
+  char temp_str[41];
+  // Draw rest in Unifont
   u8g2.setFont(u8g2_font_unifont_tr);
-  sprintf(temp_str, "%u", next_keyer_state);
+
+  // Draw keyer speed
+  sprintf(temp_str, "WPM:%d", keyer_speed);
   u8g2.drawStr(0, 50, temp_str);
 
   if(tx && break_in) {
-      // Draw SWR
+    // Draw SWR
     const uint16_t swr_calibration_corr = 250;
-    u8g2.setFont(u8g2_font_unifont_tr);
+    // u8g2.setFont(u8g2_font_unifont_tr);
 
     tx_pwr_fwd = 0;
     tx_pwr_rev = 0;
@@ -260,8 +271,8 @@ void draw_oled(void) {
       tx_pwr_rev = tx_pwr_fwd;
     }
 
-    float gamma = ((float)tx_pwr_rev) / ((float)tx_pwr_fwd);
-    float swr = (1.0 + gamma) / (1.0 - gamma);
+    gamma = ((float)tx_pwr_rev) / ((float)tx_pwr_fwd);
+    swr = (1.0 + gamma) / (1.0 - gamma);
     if(swr >= 10.0) {
       swr = 10.0;
       sprintf(temp_str, ">10");
@@ -294,31 +305,93 @@ void draw_oled(void) {
     uint8_t volts = supply_voltage / 10000;
     uint8_t millivolts = (supply_voltage % 10000) / 1000;
     sprintf(temp_str, "%2d.%1dV", volts, millivolts);
-    yield();
     u8g2.drawStr(0, 63, temp_str);
-    yield();
   }
 
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  if(!tx) {
+    task_draw_oled.setCallback(&draw_oled_3);
+  }
+  else
+  {
+    task_draw_oled.setCallback(&draw_oled_7);
+  }
+}
+
+void draw_oled_3(void) {
   // Send the buffer to the screen
   // u8g2.sendBuffer();
   
-  u8g2.updateDisplayArea(0, 0, 16, 2);
-  // yield();
-  u8g2.updateDisplayArea(0, 2, 16, 2);
-  // yield();
-  u8g2.updateDisplayArea(0, 4, 16, 2);
-  // yield();
-  u8g2.updateDisplayArea(0, 6, 16, 2);
+  u8g2.updateDisplayArea(0, 0, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_4);
+}
+
+void draw_oled_4(void) {
+  u8g2.updateDisplayArea(0, 1, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_5);
+}
+
+void draw_oled_5(void) {
+  u8g2.updateDisplayArea(0, 2, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_6);
+}
+
+void draw_oled_6(void) {
+  u8g2.updateDisplayArea(0, 3, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_7);
+}
+
+void draw_oled_7(void) {
+  u8g2.updateDisplayArea(0, 4, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_8);
+}
+
+void draw_oled_8(void) {
+  u8g2.updateDisplayArea(0, 5, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_9);
+}
+
+void draw_oled_9(void) {
+  u8g2.updateDisplayArea(0, 6, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_10);
+}
+
+void draw_oled_10(void) {
+  u8g2.updateDisplayArea(0, 7, 16, 1);
+
+  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled);
 }
 
 void paddle_ring_change() {
   // task_draw_oled.disable();
   // task_process_inputs.disable();
   if(digitalRead(PADDLE_RING_PIN) == LOW) {
-    paddle_ring_active = true;
-    if(keyer_mode == KeyerMode::STRAIGHT) {
-      task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
-      task_key_down.enable();
+    if (curr_keyer_state == KeyerState::PLAYBACK || curr_keyer_state == KeyerState::TUNE) { // Cancel playback if button pressed
+      morse.reset();
+      key_up();
+      curr_keyer_state = KeyerState::IDLE;
+    }
+    else {
+      paddle_ring_active = true;
+      if(keyer_mode == KeyerMode::STRAIGHT) {
+        task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
+        task_key_down.enable();
+      }
     }
   }
   else {
@@ -332,11 +405,18 @@ void paddle_ring_change() {
 
 void paddle_tip_change() {
   if(digitalRead(PADDLE_TIP_PIN) == LOW) {
-    paddle_tip_active = true;
-    // if(keyer_mode == KeyerMode::STRAIGHT) {
-    //   // task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
-    //   // task_key_down.enable();
-    // }
+    if (curr_keyer_state == KeyerState::PLAYBACK || curr_keyer_state == KeyerState::TUNE) { // Cancel playback if button pressed
+      morse.reset();
+      key_up();
+      curr_keyer_state = KeyerState::IDLE;
+    }
+    else {
+      paddle_tip_active = true;
+      // if(keyer_mode == KeyerMode::STRAIGHT) {
+      //   // task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
+      //   // task_key_down.enable();
+      // }
+    }
   }
   else {
     // key_up();
@@ -351,6 +431,7 @@ void paddle_tip_change() {
 void key_down() {
   task_draw_oled.disable();
   task_process_inputs.disable();
+  task_process_keyer.disable();
   tx = true;
   // setPABias(1800);
   digitalWrite(MUTE_PIN, HIGH);
@@ -361,6 +442,7 @@ void key_down() {
     si5351.output_enable(SI5351_CLK1, 1);
     digitalWrite(TX_PIN, HIGH);
   }
+  task_process_keyer.enableDelayed();
   task_process_inputs.enableDelayed();
   task_draw_oled.enableDelayed();
 }
@@ -368,6 +450,7 @@ void key_down() {
 void key_up() {
   task_draw_oled.disable();
   task_process_inputs.disable();
+  task_process_keyer.disable();
   digitalWrite(TX_PIN, LOW);
   // setPABias(0);
   si5351.output_enable(SI5351_CLK1, 0);
@@ -375,8 +458,9 @@ void key_up() {
   digitalWrite(MUTE_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
   tx = false;
-  memset(tx_pwr_fwd_buf, 0, SWR_BUFFER_SIZE);
-  memset(tx_pwr_rev_buf, 0, SWR_BUFFER_SIZE);
+  // memset(tx_pwr_fwd_buf, 0, SWR_BUFFER_SIZE);
+  // memset(tx_pwr_rev_buf, 0, SWR_BUFFER_SIZE);
+  task_process_keyer.enableDelayed();
   task_process_inputs.enableDelayed();
   task_draw_oled.enableDelayed();
 }
@@ -414,6 +498,12 @@ Button process_button() {
 }
 
 void process_keyer() {
+  // if(curr_keyer_state == KeyerState::PLAYBACK)
+  // {
+  //   morse.update();
+  // }
+  // led_toggle();
+
   // Process the keyer state machine
   switch (curr_keyer_state)
   {
@@ -555,23 +645,15 @@ void process_keyer() {
       //     next_keyer_state = KeyerState::DAH;
       //   }
       // }
+      break;
     case KeyerState::PLAYBACK:
-      // if (morse.busy == false)
-      // {
-      //   noTone();
-      //   curr_keyer_state = KeyerState::IDLE;
-      // }
-      // if (sidetone_active)
-      // {
-      //   if (morse.tx)
-      //   {
-      //     tone(SIDETONE_OUTPUT, DEFAULT_SIDETONE_FREQ);
-      //   }
-      //   else
-      //   {
-      //     noTone();
-      //   }
-      // }
+      // morse.update();
+      // led_toggle();
+      if (morse.busy == false)
+      {
+        curr_keyer_state = KeyerState::IDLE;
+        morse.reset();
+      }
       break;
     case KeyerState::ANNUNCIATE:
       break;
@@ -731,6 +813,21 @@ void send_dah() {
     task_keyer_ditdah_expire.enableDelayed();
 }
 
+void morse_update() {
+  // led_toggle();
+  if(curr_keyer_state == KeyerState::PLAYBACK)
+  {
+    morse.update();
+  }
+}
+
+// void send_message(uint8_t addr)
+// {
+//   char out[41];
+//   EEPROM.get(addr, out);
+//   morse.send(out);
+// }
+
 // Voltage specified in millivolts
 void setPABias(uint16_t voltage) {
   uint32_t reg;
@@ -754,15 +851,14 @@ void setPABias(uint16_t voltage) {
   Wire.endTransmission();
 }
 
-// void led_toggle() {
-//   led = !led;
-//   digitalWrite(LED_PIN, led);
-// }
+void led_toggle() {
+  led = !led;
+  digitalWrite(16, led);
+}
 
 void process_inputs() {
-    // Process buttons
-  Button cur_button = process_button();
-  // yield();
+  // Process buttons
+  cur_button = process_button();
   if (cur_button != Button::NONE) // Handle a button press
   {
     if (last_button == Button::NONE) // Short press
@@ -795,42 +891,41 @@ void process_inputs() {
     if (last_button != Button::NONE)  // Check if this is a release
     {
       // digitalWrite(LED_PIN, HIGH);
-      if ((millis() >= (button_press_time + BUTTON_PRESS_SHORT)) && (millis() < (button_press_time + BUTTON_PRESS_LONG))) // Short press
-      {
-        // digitalWrite(LED_PIN, HIGH);
-        switch(last_button) {
-          case Button::S1:
-            break;
-          case Button::S2:
-            break;
-          case Button::S3:
-            break;
-          case Button::S4:
-            break;
-          case Button::S5:
-            break;
-          case Button::S_ENC:
-            freqsteps++;
-            if (freqsteps > arraylength - 1 ) {
-              freqsteps = 0;
-            }
-            break;
+      if ((millis() >= (button_press_time + BUTTON_PRESS_SHORT)) && (millis() < (button_press_time + BUTTON_PRESS_LONG))) { // Short press
+        if (curr_keyer_state == KeyerState::PLAYBACK || curr_keyer_state == KeyerState::TUNE) { // Cancel playback if button pressed
+          morse.reset();
+          key_up();
+          curr_keyer_state = KeyerState::IDLE;
+        }
+        else {
+          switch(last_button) {
+            case Button::S1:
+              
+              break;
+            case Button::S2:
+              morse.setWPM(keyer_speed);
+              curr_keyer_state = KeyerState::PLAYBACK;
+              morse.send("NT7S");
+              break;
+            case Button::S3:
+              break;
+            case Button::S4:
+              break;
+            case Button::S5:
+              break;
+            case Button::S_ENC:
+              freqsteps++;
+              if (freqsteps > arraylength - 1 ) {
+                freqsteps = 0;
+              }
+              break;
+          }
         }
       }
       // button_press_time = UINT32_MAX;
       last_button = Button::NONE;
     }
   }
-
-  // Read paddles
-  // if (digitalRead(PADDLE_RING_PIN) == LOW && tx == false) {
-  //   tx = true;
-  //   key_down();
-  // }
-  // else if (digitalRead(PADDLE_RING_PIN) == HIGH && tx == true) {
-  //   tx = false;
-  //   key_up();
-  // }
 
   // Read supply voltage
   int supply_temp = analogRead(VSENSE_PIN);
@@ -839,7 +934,7 @@ void process_inputs() {
   // Scaling factors multiplied together are 0.0045
   supply_voltage = 45UL * supply_temp;
 
-  // Read SWR into ring buffer
+  // // Read SWR into ring buffer
   if(tx) {
     // tx_pwr_fwd = analogRead(TX_PWR_FWD_PIN);
     // tx_pwr_rev = analogRead(TX_PWR_REV_PIN);
@@ -885,12 +980,13 @@ void process_inputs() {
     lastReportedPos = frequency;
     si5351.set_freq((frequency + iffreq - cw_tone) * 100ULL, SI5351_CLK0);
     si5351.set_freq(frequency * 100ULL, SI5351_CLK1);
+    sprintf_seperated(freq_str, frequency);
   }
 }
 
 void setup() {
 
-  // Wire.setClock(400000UL);
+  Wire.setClock(400000UL);
 
   // Set GPIO
   pinMode(ENC_A_PIN, INPUT_PULLUP);
@@ -903,6 +999,7 @@ void setup() {
   pinMode(SIDETONE_PIN, OUTPUT);
   pinMode(TX_PWR_FWD_PIN, INPUT);
   pinMode(TX_PWR_REV_PIN, INPUT);
+  pinMode(16, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
   attachInterrupt(digitalPinToInterrupt(PADDLE_RING_PIN), paddle_ring_change, CHANGE);
@@ -915,9 +1012,10 @@ void setup() {
 
   // Set ADC resolution to 12 bits
   analogReadResolution(12);
+  // analogClockSpeed(3000);
 
   // Initialize the display
-  u8g2.setBusClock(400000);
+  // u8g2.setBusClock(400000);
   u8g2.begin();
 
   // Initialize the Si5351A  
@@ -931,12 +1029,11 @@ void setup() {
 
   // Set up task scheulder
   runner.setHighPriorityScheduler(&hprunner);
-  // task_draw_oled.enable();
-  // task_process_inputs.enable();
-  // runner.enableAll(true);
 
   // Wire.setClock(400000);
   setPABias(1800);
+
+  // morse_timer.setInterval(1, morse_update);
 
   dit_length = (1200 / keyer_speed);
 }
@@ -945,6 +1042,30 @@ void loop()
 {
   runner.execute();
 
+  // cur_button = process_button();
+
+  // // Read supply voltage
+  // int supply_temp = analogRead(VSENSE_PIN);
+  // // 12-bit ADC, 3.3 V supply, each bit is 805.5 uV
+  // // Voltage divider is 22k/100k, so scale factor is 5.55
+  // // Scaling factors multiplied together are 0.0045
+  // supply_voltage = 45UL * supply_temp;
+
+  // // Read SWR into ring buffer
+  // if(tx) {
+  //   // tx_pwr_fwd = analogRead(TX_PWR_FWD_PIN);
+  //   // tx_pwr_rev = analogRead(TX_PWR_REV_PIN);
+  //   tx_pwr_fwd_buf[tx_pwr_fwd_buf_head] = analogRead(TX_PWR_FWD_PIN);
+  //   tx_pwr_rev_buf[tx_pwr_rev_buf_head] = analogRead(TX_PWR_REV_PIN);
+  //   if(++tx_pwr_fwd_buf_head > SWR_BUFFER_SIZE) {
+  //     tx_pwr_fwd_buf_head = 0;
+  //   }
+  //   if(++tx_pwr_rev_buf_head > SWR_BUFFER_SIZE) {
+  //     tx_pwr_rev_buf_head = 0;
+  //   }
+  // }
+
+  // morse_timer.run();
   // if (Serial.available() > 0)   // see if incoming serial data:
   // {
   //   inData = Serial.read();  // read oldest byte in serial buffer:
