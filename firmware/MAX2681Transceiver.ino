@@ -71,7 +71,7 @@ VFO signal output on CLK0, BFO signal on CLK2
 #include <TaskScheduler.h>
 
 // Enumerations
-enum class KeyerState {IDLE, DIT, DAH, DITIDLE, DAHIDLE, CHARSPACE, PLAYBACK, ANNUNCIATE, UART, TUNE};
+enum class KeyerState {IDLE, DIT, DAH, CHARSPACE, PLAYBACK, ANNUNCIATE, UART, TUNE};
 enum class Button {NONE, S1, S2, S3, S4, S5, S_ENC, HOLD};
 enum class KeyerMode {A, B, STRAIGHT};
 
@@ -94,9 +94,9 @@ Scheduler hprunner;
 Morse morse(&key_down, &key_up, DEFAULT_KEYER_SPEED);
 
 // Tasks
-Task task_process_keyer(1, TASK_FOREVER, &process_keyer, &hprunner, true);
+Task task_process_keyer(2, TASK_FOREVER, &process_keyer, &hprunner, true);
 Task task_keyer_update(1, TASK_FOREVER, &morse_update, &hprunner, true);
-Task task_process_inputs(25, TASK_FOREVER, &process_inputs, &runner, true);
+Task task_process_inputs(20, TASK_FOREVER, &process_inputs, &runner, true);
 Task task_draw_oled(DRAW_OLED_STEP_TIME, TASK_FOREVER, &draw_oled, &runner, true);
 Task task_key_down(TASK_IMMEDIATE, TASK_ONCE, &key_down, &runner, false);
 Task task_key_up(TASK_IMMEDIATE, TASK_ONCE, &key_up, &runner, false);
@@ -111,6 +111,10 @@ volatile bool led = false;
 volatile bool break_in = true;
 volatile bool paddle_tip_active = false;
 volatile bool paddle_ring_active = false;
+volatile bool paddle_reverse = false;
+volatile KeyerState prev_keyer_state = KeyerState::IDLE;
+volatile KeyerState curr_keyer_state = KeyerState::IDLE;
+volatile KeyerState next_keyer_state = KeyerState::IDLE;
 
 // Global variables
 unsigned long iffreq = 6143900UL; // set the IF frequency in Hz.
@@ -132,10 +136,10 @@ uint16_t tx_pwr_fwd_buf[SWR_BUFFER_SIZE] = {};
 uint16_t tx_pwr_rev_buf[SWR_BUFFER_SIZE] = {};
 uint8_t tx_pwr_fwd_buf_head = 0;
 uint8_t tx_pwr_rev_buf_head = 0;
-KeyerState prev_keyer_state = KeyerState::IDLE;
-KeyerState curr_keyer_state = KeyerState::IDLE;
-KeyerState next_keyer_state = KeyerState::IDLE;
-bool paddle_reverse = false;
+// KeyerState prev_keyer_state = KeyerState::IDLE;
+// KeyerState curr_keyer_state = KeyerState::IDLE;
+// KeyerState next_keyer_state = KeyerState::IDLE;
+
 KeyerMode keyer_mode = KeyerMode::A;
 uint16_t dit_length;
 uint32_t keyer_speed = DEFAULT_KEYER_SPEED;
@@ -248,20 +252,16 @@ void draw_oled(void) {
       u8g2.drawBox(68, 33, 5, 2);
       break;
   }
-  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
-  task_draw_oled.setCallback(&draw_oled_2);
-}
 
-void draw_oled_2(void) {
   char temp_str[41];
   // Draw rest in Unifont
   u8g2.setFont(u8g2_font_unifont_tr);
 
   // Draw keyer speed
-  sprintf(temp_str, "%d WPM", keyer_speed);
-  u8g2.drawStr(0, 50, temp_str);
-  // sprintf(temp_str, "%u", button_adc);
+  // sprintf(temp_str, "%d WPM", keyer_speed);
   // u8g2.drawStr(0, 50, temp_str);
+  sprintf(temp_str, "%u  %u  %u", prev_keyer_state, curr_keyer_state, next_keyer_state);
+  u8g2.drawStr(0, 50, temp_str);
 
   if(tx && break_in) {
     // Draw SWR
@@ -576,14 +576,15 @@ void process_keyer() {
     case KeyerState::DIT:  // Where the squeeze keying happens
       if (keyer_mode == KeyerMode::A)
       {
-        if (paddle_reverse ? paddle_tip_active : paddle_ring_active && next_keyer_state == KeyerState::IDLE)
+        // if (paddle_reverse ? paddle_tip_active : paddle_ring_active && next_keyer_state == KeyerState::IDLE)
+        if (paddle_reverse ? paddle_tip_active : paddle_ring_active)
         {
-          prev_keyer_state = KeyerState::DIT;
+          // prev_keyer_state = KeyerState::DIT;
           next_keyer_state = KeyerState::DAH;
         }
         else if (!paddle_ring_active && !paddle_tip_active)
         {
-          next_keyer_state = KeyerState::IDLE;
+          // next_keyer_state = KeyerState::IDLE;
         }
       }
       else if (keyer_mode == KeyerMode::B)
@@ -605,14 +606,14 @@ void process_keyer() {
     case KeyerState::DAH:  // Where the squeeze keying happens
       if (keyer_mode == KeyerMode::A)
       {
-        if (paddle_reverse ? paddle_ring_active : paddle_tip_active && next_keyer_state == KeyerState::IDLE)
+        if (paddle_reverse ? paddle_ring_active : paddle_tip_active)
         {
           // prev_keyer_state = KeyerState::DAH;
           next_keyer_state = KeyerState::DIT;
         }
         else if (!paddle_ring_active && !paddle_tip_active)
         {
-          next_keyer_state = KeyerState::IDLE;
+          // next_keyer_state = KeyerState::IDLE;
         }
       }
       else if (keyer_mode == KeyerMode::B)
@@ -631,46 +632,24 @@ void process_keyer() {
       // }
       break;
     case KeyerState::CHARSPACE:
-      // if (prev_keyer_state == KeyerState::DAH && next_keyer_state == KeyerState::IDLE) {
-      if (prev_keyer_state == KeyerState::DAH) {
-        if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
+      if (paddle_tip_active && paddle_ring_active && next_keyer_state == KeyerState::IDLE) {
+        if (prev_keyer_state == KeyerState::DAH) {
           next_keyer_state = KeyerState::DIT;
         }
-        else if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
-          next_keyer_state = KeyerState::DAH;
-        }
-        else if (paddle_tip_active && paddle_ring_active) {
-          next_keyer_state = KeyerState::DIT;
+        else if (prev_keyer_state == KeyerState::DIT) {
+          next_keyer_state == KeyerState::DAH;
         }
       }
-      else if (prev_keyer_state == KeyerState::DIT) {
-        if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
-          next_keyer_state = KeyerState::DAH;
-        }
-        else if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
-          next_keyer_state = KeyerState::DIT;
-        }
-        else if (paddle_tip_active && paddle_ring_active) {
+      else if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
+        if (next_keyer_state == KeyerState::IDLE && prev_keyer_state == KeyerState::DIT) {
           next_keyer_state = KeyerState::DAH;
         }
       }
-      // if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
-      //   next_keyer_state = KeyerState::DIT;
-      // }
-      // else if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
-      //   next_keyer_state = KeyerState::DAH;
-      // }
-      // break;
-      // if (prev_keyer_state == KeyerState::DAH) {
-      //   if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
-      //     next_keyer_state = KeyerState::DIT;
-      //   }
-      // }
-      // else if (prev_keyer_state == KeyerState::DIT) {
-      //   if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
-      //     next_keyer_state = KeyerState::DAH;
-      //   }
-      // }
+      else if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
+        if (next_keyer_state == KeyerState::IDLE && prev_keyer_state == KeyerState::DAH) {
+          next_keyer_state = KeyerState::DIT;
+        }
+      } 
       break;
     case KeyerState::PLAYBACK:
       // morse.update();
@@ -763,8 +742,8 @@ void process_keyer() {
 
 void keyer_ditdah_expire() {
   // Turn off display updates until keying is done
-  // task_draw_oled.disable();
-  // task_process_inputs.disable();
+  task_draw_oled.disable();
+  task_process_inputs.disable();
 
   // Key up
   task_key_up.set(TASK_IMMEDIATE, TASK_ONCE, &key_up);
@@ -796,23 +775,52 @@ void keyer_charspace_expire() {
   }
   else
   {
-    curr_keyer_state = KeyerState::IDLE;
-    next_keyer_state = KeyerState::IDLE;
-
-    // Turn off display updates until keying is done
-    // task_draw_oled.disable();
-    // task_process_inputs.disable();
-
-    // Key up
-    task_key_up.set(TASK_IMMEDIATE, TASK_ONCE, &key_up);
-    task_key_up.enable();
+    if (paddle_tip_active && (keyer_mode != KeyerMode::STRAIGHT))
+    {
+      if (paddle_reverse)
+      {
+        // prev_keyer_state = KeyerState::DAH;
+        curr_keyer_state = KeyerState::DAH;
+        send_dah();
+      }
+      else
+      {
+        // prev_keyer_state = KeyerState::DIT;
+        curr_keyer_state = KeyerState::DIT;
+        send_dit();
+      }
+      prev_keyer_state = KeyerState::IDLE;
+      next_keyer_state = KeyerState::IDLE;
+    }
+    else if (paddle_ring_active && (keyer_mode != KeyerMode::STRAIGHT))
+    {
+      if (paddle_reverse)
+      {
+        // prev_keyer_state = KeyerState::DIT;
+        curr_keyer_state = KeyerState::DIT;
+        send_dit();
+      }
+      else
+      {
+        // prev_keyer_state = KeyerState::DAH;
+        curr_keyer_state = KeyerState::DAH;
+        send_dah();
+      }
+      prev_keyer_state = KeyerState::IDLE;
+      next_keyer_state = KeyerState::IDLE;
+    }
+    else {
+      prev_keyer_state = curr_keyer_state;
+      curr_keyer_state = KeyerState::IDLE;
+      next_keyer_state = KeyerState::IDLE;
+    }
   }
 }
 
 void send_dit() {
   // Turn off display updates until keying is done
-    // task_draw_oled.disable();
-    // task_process_inputs.disable();
+    task_draw_oled.disable();
+    task_process_inputs.disable();
 
     // Key down
     task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
@@ -826,8 +834,8 @@ void send_dit() {
 
 void send_dah() {
   // Turn off display updates until keying is done
-    // task_draw_oled.disable();
-    // task_process_inputs.disable();
+    task_draw_oled.disable();
+    task_process_inputs.disable();
 
     // Key down
     task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
