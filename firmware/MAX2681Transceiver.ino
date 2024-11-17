@@ -36,34 +36,35 @@ VFO signal output on CLK0, BFO signal on CLK2
 // Limits
 #define KEYER_SPEED_LOWER 5
 #define KEYER_SPEED_UPPER 40
-#define BUTTON_ADC_MARGIN 40
+#define BUTTON_ADC_MARGIN 80
 #define BUTTON_PRESS_SHORT 10
 #define BUTTON_PRESS_LONG 1000
-#define SWR_BUFFER_SIZE 10
+#define SWR_BUFFER_SIZE 4
 
 // Defaults
-#define DEFAULT_KEYER_SPEED 20
+#define DEFAULT_KEYER_SPEED 18
 
 // Other constants
-#define BUTTON_1_ADC 192
+#define BUTTON_1_ADC 190
 #define BUTTON_1_ADC_LOW BUTTON_1_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_1_ADC_HIGH BUTTON_1_ADC + BUTTON_ADC_MARGIN
-#define BUTTON_2_ADC 379
+#define BUTTON_2_ADC 380
 #define BUTTON_2_ADC_LOW BUTTON_2_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_2_ADC_HIGH BUTTON_2_ADC + BUTTON_ADC_MARGIN
-#define BUTTON_3_ADC 751
+#define BUTTON_3_ADC 750
 #define BUTTON_3_ADC_LOW BUTTON_3_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_3_ADC_HIGH BUTTON_3_ADC + BUTTON_ADC_MARGIN
-#define BUTTON_4_ADC 1018
+#define BUTTON_4_ADC 1010
 #define BUTTON_4_ADC_LOW BUTTON_4_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_4_ADC_HIGH BUTTON_4_ADC + BUTTON_ADC_MARGIN
-#define BUTTON_5_ADC 1315
+#define BUTTON_5_ADC 1320
 #define BUTTON_5_ADC_LOW BUTTON_5_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_5_ADC_HIGH BUTTON_5_ADC + BUTTON_ADC_MARGIN
-#define BUTTON_ENC_ADC 2065
+#define BUTTON_ENC_ADC 2060
 #define BUTTON_ENC_ADC_LOW BUTTON_ENC_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_ENC_ADC_HIGH BUTTON_ENC_ADC + BUTTON_ADC_MARGIN
-#define DRAW_OLED_STEP_TIME 9
+#define DRAW_OLED_STEP_TIME 3
+#define DRAW_OLED_STEP_TIME_TX 9
 
 // #define _TASK_MICRO_RES
 #define _TASK_PRIORITY
@@ -138,8 +139,8 @@ bool paddle_reverse = false;
 KeyerMode keyer_mode = KeyerMode::A;
 uint16_t dit_length;
 uint32_t keyer_speed = DEFAULT_KEYER_SPEED;
-float gamma;
-float swr;
+uint32_t gamma;
+uint8_t swr;
 char freq_str[15];
 
 // This interrupt routine will be called on any change of one of the input signals
@@ -197,6 +198,25 @@ void sprintf_seperated(char *str, unsigned long num) {
   }
 }
 
+// We don't need the full log10 function because of the program memory that it uses,
+// so we'll use an estimate for drawing the SWR graph that takes a lot less memory.
+// Takes an unsigned int that is clamped from 10 to 100 (since this represents the 
+// SWR * 10 and we only care about SWR values from 1 to 10) and returns the log10 * 10.
+uint8_t swr_log(uint8_t swr) {
+  const uint8_t log_lut[] = {0, 4, 7, 11, 14, 17, 20, 23, 25, 27, 30, 32, 34, 36, 38, 39, 41, 43, 
+  44, 46, 47, 49, 50, 51, 53, 54, 55, 56, 57, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 69, 70, 
+  71, 72, 73, 74, 74, 75, 76, 77, 77, 78, 79, 79, 80, 81, 81, 82, 83, 83, 84, 85, 85, 86, 86, 87, 
+  88, 88, 89, 89, 90, 90, 91, 91, 92, 92, 93, 93, 94, 94, 95, 95, 96, 96, 97, 97, 98, 98, 99, 99};
+  if (swr < 10) {
+    swr = 10;
+  }
+  else if (swr > 100) {
+    swr = 100;
+  }
+  swr -= 11;
+  return log_lut[swr];
+}
+
 void draw_oled(void) {
   // char temp_str[41];
   u8g2.clearBuffer();
@@ -228,7 +248,7 @@ void draw_oled(void) {
       u8g2.drawBox(68, 33, 5, 2);
       break;
   }
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_2);
 }
 
@@ -238,12 +258,15 @@ void draw_oled_2(void) {
   u8g2.setFont(u8g2_font_unifont_tr);
 
   // Draw keyer speed
-  sprintf(temp_str, "WPM:%d", keyer_speed);
+  sprintf(temp_str, "%d WPM", keyer_speed);
   u8g2.drawStr(0, 50, temp_str);
+  // sprintf(temp_str, "%u", button_adc);
+  // u8g2.drawStr(0, 50, temp_str);
 
   if(tx && break_in) {
     // Draw SWR
-    const uint16_t swr_calibration_corr = 250;
+    // const uint16_t swr_calibration_corr = 240;
+    const uint16_t swr_calibration_corr = 0;
     // u8g2.setFont(u8g2_font_unifont_tr);
 
     tx_pwr_fwd = 0;
@@ -271,32 +294,34 @@ void draw_oled_2(void) {
       tx_pwr_rev = tx_pwr_fwd;
     }
 
-    gamma = ((float)tx_pwr_rev) / ((float)tx_pwr_fwd);
-    swr = (1.0 + gamma) / (1.0 - gamma);
-    if(swr >= 10.0) {
-      swr = 10.0;
+    // Use fixed point math to save program memory
+    gamma = (tx_pwr_rev * 100) / tx_pwr_fwd;
+    // gamma = ((float)tx_pwr_rev) / ((float)tx_pwr_fwd);
+    swr = ((100 + gamma) * 10) / (100 - gamma);
+    if(swr >= 100) {
+      swr = 100;
       sprintf(temp_str, ">10");
     }
     else {
-      uint8_t temp_swr = (uint8_t)(swr * 10) % 10;
-      sprintf(temp_str, "%1d.%d", (uint8_t) swr, temp_swr);
+      // uint8_t temp_swr = (uint8_t)(swr * 10) % 10;
+      sprintf(temp_str, "%1d.%d", (uint8_t) swr / 10, swr % 10);
     }
     u8g2.drawStr(0, 63, temp_str);
-    
-    // sprintf(temp_str, "%lu", dit_length);
-    // u8g2.drawStr(0, 50, temp_str);
+
+    // sprintf(temp_str, "%lu %lu", tx_pwr_fwd, tx_pwr_rev);
+    // u8g2.drawStr(0, 63, temp_str);
 
     // Draw SWR graph
-    const uint8_t swr_graph_x_pos = 27;
+    const uint8_t swr_graph_x_pos = 25;
     const uint8_t swr_graph_y_pos = 52;
-    const uint8_t swr_graph_width = 100;
+    const uint8_t swr_graph_width = 103;
     const uint8_t swr_graph_height = 12;
     
     // TODO: should probably change to LUT for space savings
-    float swr_graph = log10(swr);
+    uint8_t swr_graph = swr_log(swr);
     u8g2.setDrawColor(1);
     u8g2.drawFrame(swr_graph_x_pos, swr_graph_y_pos, swr_graph_width, swr_graph_height);
-    uint8_t swr_graph_bar = (swr_graph_width - 4) * swr_graph;
+    uint8_t swr_graph_bar = swr_graph;
     u8g2.drawBox(swr_graph_x_pos + 2, swr_graph_y_pos + 2, swr_graph_bar, swr_graph_height - 4);
   }
   else {
@@ -308,7 +333,7 @@ void draw_oled_2(void) {
     u8g2.drawStr(0, 63, temp_str);
   }
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   if(!tx) {
     task_draw_oled.setCallback(&draw_oled_3);
   }
@@ -324,56 +349,56 @@ void draw_oled_3(void) {
   
   u8g2.updateDisplayArea(0, 0, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_4);
 }
 
 void draw_oled_4(void) {
   u8g2.updateDisplayArea(0, 1, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_5);
 }
 
 void draw_oled_5(void) {
   u8g2.updateDisplayArea(0, 2, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_6);
 }
 
 void draw_oled_6(void) {
   u8g2.updateDisplayArea(0, 3, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_7);
 }
 
 void draw_oled_7(void) {
   u8g2.updateDisplayArea(0, 4, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_8);
 }
 
 void draw_oled_8(void) {
   u8g2.updateDisplayArea(0, 5, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_9);
 }
 
 void draw_oled_9(void) {
   u8g2.updateDisplayArea(0, 6, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled_10);
 }
 
 void draw_oled_10(void) {
   u8g2.updateDisplayArea(0, 7, 16, 1);
 
-  task_draw_oled.setInterval(DRAW_OLED_STEP_TIME);
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
   task_draw_oled.setCallback(&draw_oled);
 }
 
@@ -558,7 +583,7 @@ void process_keyer() {
         }
         else if (!paddle_ring_active && !paddle_tip_active)
         {
-          // next_keyer_state = KeyerState::IDLE;
+          next_keyer_state = KeyerState::IDLE;
         }
       }
       else if (keyer_mode == KeyerMode::B)
@@ -587,7 +612,7 @@ void process_keyer() {
         }
         else if (!paddle_ring_active && !paddle_tip_active)
         {
-          // next_keyer_state = KeyerState::IDLE;
+          next_keyer_state = KeyerState::IDLE;
         }
       }
       else if (keyer_mode == KeyerMode::B)
@@ -606,7 +631,8 @@ void process_keyer() {
       // }
       break;
     case KeyerState::CHARSPACE:
-      if (prev_keyer_state == KeyerState::DAH && next_keyer_state == KeyerState::IDLE) {
+      // if (prev_keyer_state == KeyerState::DAH && next_keyer_state == KeyerState::IDLE) {
+      if (prev_keyer_state == KeyerState::DAH) {
         if (paddle_reverse ? paddle_ring_active : paddle_tip_active) {
           next_keyer_state = KeyerState::DIT;
         }
@@ -617,7 +643,7 @@ void process_keyer() {
           next_keyer_state = KeyerState::DIT;
         }
       }
-      else if (prev_keyer_state == KeyerState::DIT && next_keyer_state == KeyerState::IDLE) {
+      else if (prev_keyer_state == KeyerState::DIT) {
         if (paddle_reverse ? paddle_tip_active : paddle_ring_active) {
           next_keyer_state = KeyerState::DAH;
         }
@@ -910,6 +936,9 @@ void process_inputs() {
             case Button::S3:
               break;
             case Button::S4:
+              morse.setWPM(keyer_speed);
+              curr_keyer_state = KeyerState::PLAYBACK;
+              morse.send("TEST TEST TEST DE NT7S NT7S NT7S");
               break;
             case Button::S5:
               break;
@@ -985,9 +1014,6 @@ void process_inputs() {
 }
 
 void setup() {
-
-  Wire.setClock(400000UL);
-
   // Set GPIO
   pinMode(ENC_A_PIN, INPUT_PULLUP);
   pinMode(ENC_B_PIN, INPUT_PULLUP);
@@ -1015,7 +1041,7 @@ void setup() {
   // analogClockSpeed(3000);
 
   // Initialize the display
-  // u8g2.setBusClock(400000);
+  
   u8g2.begin();
 
   // Initialize the Si5351A  
@@ -1027,10 +1053,11 @@ void setup() {
   si5351.drive_strength(SI5351_CLK1, SI5351_DRIVE_8MA);
   si5351.output_enable(SI5351_CLK1, 0);
 
+  u8g2.setBusClock(400000);
+
   // Set up task scheulder
   runner.setHighPriorityScheduler(&hprunner);
 
-  // Wire.setClock(400000);
   setPABias(1800);
 
   // morse_timer.setInterval(1, morse_update);
@@ -1042,30 +1069,6 @@ void loop()
 {
   runner.execute();
 
-  // cur_button = process_button();
-
-  // // Read supply voltage
-  // int supply_temp = analogRead(VSENSE_PIN);
-  // // 12-bit ADC, 3.3 V supply, each bit is 805.5 uV
-  // // Voltage divider is 22k/100k, so scale factor is 5.55
-  // // Scaling factors multiplied together are 0.0045
-  // supply_voltage = 45UL * supply_temp;
-
-  // // Read SWR into ring buffer
-  // if(tx) {
-  //   // tx_pwr_fwd = analogRead(TX_PWR_FWD_PIN);
-  //   // tx_pwr_rev = analogRead(TX_PWR_REV_PIN);
-  //   tx_pwr_fwd_buf[tx_pwr_fwd_buf_head] = analogRead(TX_PWR_FWD_PIN);
-  //   tx_pwr_rev_buf[tx_pwr_rev_buf_head] = analogRead(TX_PWR_REV_PIN);
-  //   if(++tx_pwr_fwd_buf_head > SWR_BUFFER_SIZE) {
-  //     tx_pwr_fwd_buf_head = 0;
-  //   }
-  //   if(++tx_pwr_rev_buf_head > SWR_BUFFER_SIZE) {
-  //     tx_pwr_rev_buf_head = 0;
-  //   }
-  // }
-
-  // morse_timer.run();
   // if (Serial.available() > 0)   // see if incoming serial data:
   // {
   //   inData = Serial.read();  // read oldest byte in serial buffer:
