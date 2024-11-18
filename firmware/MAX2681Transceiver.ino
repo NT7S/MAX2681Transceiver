@@ -39,10 +39,12 @@ VFO signal output on CLK0, BFO signal on CLK2
 #define BUTTON_ADC_MARGIN 80
 #define BUTTON_PRESS_SHORT 10
 #define BUTTON_PRESS_LONG 1000
-#define SWR_BUFFER_SIZE 4
+#define SWR_BUFFER_SIZE 6
 
 // Defaults
-#define DEFAULT_KEYER_SPEED 18
+#define DEFAULT_KEYER_SPEED 32
+#define DEFAULT_CW_TONE 600UL
+#define DEFAULT_IF_FREQ 6143900UL
 
 // Other constants
 #define BUTTON_1_ADC 190
@@ -63,10 +65,10 @@ VFO signal output on CLK0, BFO signal on CLK2
 #define BUTTON_ENC_ADC 2060
 #define BUTTON_ENC_ADC_LOW BUTTON_ENC_ADC - BUTTON_ADC_MARGIN
 #define BUTTON_ENC_ADC_HIGH BUTTON_ENC_ADC + BUTTON_ADC_MARGIN
-#define DRAW_OLED_STEP_TIME 3
-#define DRAW_OLED_STEP_TIME_TX 9
+#define DRAW_OLED_STEP_TIME 3000
+#define DRAW_OLED_STEP_TIME_TX 8000
 
-// #define _TASK_MICRO_RES
+#define _TASK_MICRO_RES
 #define _TASK_PRIORITY
 #include <TaskScheduler.h>
 
@@ -94,30 +96,26 @@ Scheduler hprunner;
 Morse morse(&key_down, &key_up, DEFAULT_KEYER_SPEED);
 
 // Tasks
-Task task_process_keyer(2, TASK_FOREVER, &process_keyer, &hprunner, true);
-Task task_keyer_update(1, TASK_FOREVER, &morse_update, &hprunner, true);
-Task task_process_inputs(20, TASK_FOREVER, &process_inputs, &runner, true);
+Task task_process_keyer(1000, TASK_FOREVER, &process_keyer, &hprunner, true);
+Task task_keyer_update(1000, TASK_FOREVER, &morse_update, &hprunner, true);
+Task task_process_inputs(15000, TASK_FOREVER, &process_inputs, &runner, true);
 Task task_draw_oled(DRAW_OLED_STEP_TIME, TASK_FOREVER, &draw_oled, &runner, true);
-Task task_key_down(TASK_IMMEDIATE, TASK_ONCE, &key_down, &runner, false);
-Task task_key_up(TASK_IMMEDIATE, TASK_ONCE, &key_up, &runner, false);
+Task task_key_down(TASK_IMMEDIATE, TASK_ONCE, &key_down, &hprunner, false);
+Task task_key_up(TASK_IMMEDIATE, TASK_ONCE, &key_up, &hprunner, false);
 Task task_keyer_ditdah_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_ditdah_expire, &runner, false);
 Task task_keyer_charspace_expire(TASK_IMMEDIATE, TASK_ONCE, &keyer_charspace_expire, &runner, false);
 
 // Interrupt service routine variables
 volatile unsigned long frequency = 14060000UL; // This will be the frequency it always starts on.
-volatile unsigned long cw_tone = 600UL;  // CW listening frequency
+volatile unsigned long cw_tone = DEFAULT_CW_TONE;  // CW listening frequency
 volatile bool tx = false;
 volatile bool led = false;
 volatile bool break_in = true;
 volatile bool paddle_tip_active = false;
 volatile bool paddle_ring_active = false;
-volatile bool paddle_reverse = false;
-volatile KeyerState prev_keyer_state = KeyerState::IDLE;
-volatile KeyerState curr_keyer_state = KeyerState::IDLE;
-volatile KeyerState next_keyer_state = KeyerState::IDLE;
 
 // Global variables
-unsigned long iffreq = 6143900UL; // set the IF frequency in Hz.
+unsigned long iffreq = DEFAULT_IF_FREQ; // set the IF frequency in Hz.
 
 const unsigned long freqstep[] = {50, 100, 500, 1000, 5000, 10000}; // set this to your wanted tuning rate in Hz.
 int corr = 0; // this is the correction factor for the Si5351, use calibration sketch to find value.
@@ -136,12 +134,12 @@ uint16_t tx_pwr_fwd_buf[SWR_BUFFER_SIZE] = {};
 uint16_t tx_pwr_rev_buf[SWR_BUFFER_SIZE] = {};
 uint8_t tx_pwr_fwd_buf_head = 0;
 uint8_t tx_pwr_rev_buf_head = 0;
-// KeyerState prev_keyer_state = KeyerState::IDLE;
-// KeyerState curr_keyer_state = KeyerState::IDLE;
-// KeyerState next_keyer_state = KeyerState::IDLE;
-
+bool paddle_reverse = false;
+KeyerState prev_keyer_state = KeyerState::IDLE;
+KeyerState curr_keyer_state = KeyerState::IDLE;
+KeyerState next_keyer_state = KeyerState::IDLE;
 KeyerMode keyer_mode = KeyerMode::A;
-uint16_t dit_length;
+uint32_t dit_length;
 uint32_t keyer_speed = DEFAULT_KEYER_SPEED;
 uint32_t gamma;
 uint8_t swr;
@@ -252,21 +250,25 @@ void draw_oled(void) {
       u8g2.drawBox(68, 33, 5, 2);
       break;
   }
+  task_draw_oled.setInterval(tx ? DRAW_OLED_STEP_TIME_TX : DRAW_OLED_STEP_TIME);
+  task_draw_oled.setCallback(&draw_oled_2);
+}
 
+void draw_oled_2(void) {
   char temp_str[41];
   // Draw rest in Unifont
   u8g2.setFont(u8g2_font_unifont_tr);
 
   // Draw keyer speed
-  // sprintf(temp_str, "%d WPM", keyer_speed);
-  // u8g2.drawStr(0, 50, temp_str);
-  sprintf(temp_str, "%u  %u  %u", prev_keyer_state, curr_keyer_state, next_keyer_state);
+  sprintf(temp_str, "%d WPM", keyer_speed);
   u8g2.drawStr(0, 50, temp_str);
+  // sprintf(temp_str, "%u  %u  %u", prev_keyer_state, curr_keyer_state, next_keyer_state);
+  // u8g2.drawStr(0, 50, temp_str);
 
   if(tx && break_in) {
     // Draw SWR
-    // const uint16_t swr_calibration_corr = 240;
-    const uint16_t swr_calibration_corr = 0;
+    const uint16_t swr_calibration_corr = 20;
+    // const uint16_t swr_calibration_corr = 0;
     // u8g2.setFont(u8g2_font_unifont_tr);
 
     tx_pwr_fwd = 0;
@@ -303,13 +305,9 @@ void draw_oled(void) {
       sprintf(temp_str, ">10");
     }
     else {
-      // uint8_t temp_swr = (uint8_t)(swr * 10) % 10;
       sprintf(temp_str, "%1d.%d", (uint8_t) swr / 10, swr % 10);
     }
     u8g2.drawStr(0, 63, temp_str);
-
-    // sprintf(temp_str, "%lu %lu", tx_pwr_fwd, tx_pwr_rev);
-    // u8g2.drawStr(0, 63, temp_str);
 
     // Draw SWR graph
     const uint8_t swr_graph_x_pos = 25;
@@ -317,7 +315,6 @@ void draw_oled(void) {
     const uint8_t swr_graph_width = 103;
     const uint8_t swr_graph_height = 12;
     
-    // TODO: should probably change to LUT for space savings
     uint8_t swr_graph = swr_log(swr);
     u8g2.setDrawColor(1);
     u8g2.drawFrame(swr_graph_x_pos, swr_graph_y_pos, swr_graph_width, swr_graph_height);
@@ -741,18 +738,13 @@ void process_keyer() {
 }
 
 void keyer_ditdah_expire() {
-  // Turn off display updates until keying is done
-  task_draw_oled.disable();
-  task_process_inputs.disable();
-
   // Key up
   task_key_up.set(TASK_IMMEDIATE, TASK_ONCE, &key_up);
   task_key_up.enable();
-  // digitalWrite(LED_PIN, LOW);
 
   prev_keyer_state = curr_keyer_state;
   curr_keyer_state = KeyerState::CHARSPACE;
-  task_keyer_charspace_expire.set(dit_length, TASK_ONCE, &keyer_charspace_expire);
+  task_keyer_charspace_expire.set(dit_length * 1000, TASK_ONCE, &keyer_charspace_expire);
   task_keyer_charspace_expire.enableDelayed();
 }
 
@@ -818,32 +810,24 @@ void keyer_charspace_expire() {
 }
 
 void send_dit() {
-  // Turn off display updates until keying is done
-    task_draw_oled.disable();
-    task_process_inputs.disable();
-
     // Key down
     task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
     task_key_down.enable();
     // digitalWrite(LED_PIN, HIGH);
 
     // Delay for a dit length
-    task_keyer_ditdah_expire.set(dit_length, TASK_ONCE, &keyer_ditdah_expire);
+    task_keyer_ditdah_expire.set(dit_length * 1000, TASK_ONCE, &keyer_ditdah_expire);
     task_keyer_ditdah_expire.enableDelayed();
 }
 
 void send_dah() {
-  // Turn off display updates until keying is done
-    task_draw_oled.disable();
-    task_process_inputs.disable();
-
     // Key down
     task_key_down.set(TASK_IMMEDIATE, TASK_ONCE, &key_down);
     task_key_down.enable();
     // digitalWrite(LED_PIN, HIGH);
 
     // Delay for a dah length
-    task_keyer_ditdah_expire.set(dit_length * 3, TASK_ONCE, &keyer_ditdah_expire);
+    task_keyer_ditdah_expire.set(dit_length * 3000, TASK_ONCE, &keyer_ditdah_expire);
     task_keyer_ditdah_expire.enableDelayed();
 }
 
@@ -1046,10 +1030,8 @@ void setup() {
 
   // Set ADC resolution to 12 bits
   analogReadResolution(12);
-  // analogClockSpeed(3000);
 
   // Initialize the display
-  
   u8g2.begin();
 
   // Initialize the Si5351A  
